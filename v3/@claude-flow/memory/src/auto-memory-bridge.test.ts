@@ -754,6 +754,74 @@ Already in DB
       expect(skipEvent).toBeDefined();
       expect(skipEvent.reason).toBe('no-matching-topic-files');
     });
+
+    // #3224: the #1556 guard above only holds while zero topic files exist.
+    // The bridge creates its own first topic file (e.g. patterns.md) the
+    // moment an insight is recorded, which used to make the guard stop
+    // applying and silently destroy a hand-maintained MEMORY.md on that
+    // very next curate.
+    it('should not overwrite a hand-maintained MEMORY.md once a matching topic file exists (#3224)', async () => {
+      const indexPath = path.join(testDir, 'MEMORY.md');
+      const handCurated = '# My Hand-Curated Memory\n\n## Section 1\nImportant notes, 49 links elsewhere\n';
+      fsSync.writeFileSync(indexPath, handCurated, 'utf-8');
+
+      // patterns.md IS in DEFAULT_TOPIC_MAPPING (project-patterns), so the
+      // #1556 guard does not apply here — sections will be non-empty.
+      fsSync.writeFileSync(
+        path.join(testDir, 'patterns.md'),
+        '# Project Patterns\n\n- Some new insight\n',
+        'utf-8',
+      );
+
+      let skipEvent: any;
+      bridge.on('index:skipped', (e) => { skipEvent = e; });
+
+      await bridge.curateIndex();
+
+      // MEMORY.md must be byte-identical to what the user wrote.
+      expect(fsSync.readFileSync(indexPath, 'utf-8')).toBe(handCurated);
+      expect(skipEvent).toBeDefined();
+      expect(skipEvent.reason).toBe('foreign-index');
+    });
+
+    it('should curate normally once it owns the index (marker present from a prior curate)', async () => {
+      const indexPath = path.join(testDir, 'MEMORY.md');
+      fsSync.writeFileSync(path.join(testDir, 'patterns.md'), '# Project Patterns\n\n- First insight\n', 'utf-8');
+
+      // First curate creates the index and stamps it with the ownership marker.
+      await bridge.curateIndex();
+      const firstWrite = fsSync.readFileSync(indexPath, 'utf-8');
+      expect(firstWrite).toContain('First insight');
+
+      // A later curate on a file this bridge owns must still update normally.
+      fsSync.writeFileSync(path.join(testDir, 'patterns.md'), '# Project Patterns\n\n- Second insight\n', 'utf-8');
+      await bridge.curateIndex();
+
+      const secondWrite = fsSync.readFileSync(indexPath, 'utf-8');
+      expect(secondWrite).toContain('Second insight');
+    });
+
+    // Review feedback on #3224's fix: treating every unmarked MEMORY.md as
+    // foreign would also catch every index this bridge wrote *before* the
+    // marker existed, silently freezing it on upgrade. A pre-marker
+    // bridge-authored file is recognized by its exact legacy title line
+    // and continues to curate (and gets the marker going forward).
+    it('should recognize and continue curating a pre-marker (legacy) bridge-authored MEMORY.md', async () => {
+      const indexPath = path.join(testDir, 'MEMORY.md');
+      const legacyOutput = '# Claude Flow V3 Project Memory\n\n## Debugging\n- Old insight\n- See `debugging.md` for details\n';
+      fsSync.writeFileSync(indexPath, legacyOutput, 'utf-8');
+      fsSync.writeFileSync(path.join(testDir, 'debugging.md'), '# Debugging\n\n- New insight\n', 'utf-8');
+
+      let skipEvent: any;
+      bridge.on('index:skipped', (e) => { skipEvent = e; });
+
+      await bridge.curateIndex();
+
+      expect(skipEvent).toBeUndefined();
+      const after = fsSync.readFileSync(indexPath, 'utf-8');
+      expect(after).toContain('New insight');
+      expect(after).not.toBe(legacyOutput);
+    });
   });
 
   describe('getStatus', () => {

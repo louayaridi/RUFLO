@@ -154,6 +154,17 @@ const DEFAULT_TOPIC_MAPPING: Record<InsightCategory, string> = {
   'swarm-results': 'swarm-results.md',
 };
 
+// Marks a MEMORY.md this bridge wrote, so curateIndex() can tell its own
+// output apart from a hand-maintained index it must never overwrite (#3224).
+const INDEX_OWNERSHIP_MARKER = '<!-- claude-flow:auto-memory-index -->';
+
+// The exact title line buildIndexLines() has always produced. Every
+// MEMORY.md this bridge wrote before INDEX_OWNERSHIP_MARKER existed has
+// exactly this as its first line and nothing else — used to recognize
+// pre-marker bridge output so upgrading doesn't silently freeze existing
+// installs (see isBridgeOwnedIndex below).
+const INDEX_TITLE_LINE = '# Claude Flow V3 Project Memory';
+
 const CATEGORY_LABELS: Record<string, string> = {
   'project-patterns': 'Project Patterns',
   'debugging': 'Debugging',
@@ -481,6 +492,22 @@ export class AutoMemoryBridge extends EventEmitter {
       return;
     }
 
+    // Fix for #3224: the guard above only protects the *no-topic-files-yet*
+    // case. As soon as this bridge writes its first topic file, sections is
+    // non-empty and the code below used to overwrite MEMORY.md unconditionally
+    // — destroying a hand-maintained index (e.g. Claude Code's own auto
+    // memory) the very first time a real insight was recorded. Never rebuild
+    // an index this bridge did not author: a pre-existing MEMORY.md that
+    // lacks our ownership marker is presumed foreign and left untouched.
+    const indexPath = this.getIndexPath();
+    if (existsSync(indexPath)) {
+      const existingIndex = await fs.readFile(indexPath, 'utf-8');
+      if (!isBridgeOwnedIndex(existingIndex)) {
+        this.emit('index:skipped', { reason: 'foreign-index' });
+        return;
+      }
+    }
+
     // ADR-049: Use graph PageRank to prioritize sections
     let sectionOrder: string[] | undefined;
     if (this.memoryGraph) {
@@ -506,8 +533,12 @@ export class AutoMemoryBridge extends EventEmitter {
       this.config.topicMapping as Record<string, string>,
       sectionOrder,
     );
+    // Embed the marker on the title line rather than as its own line, so it
+    // doesn't perturb maxIndexLines budgeting (pruneSectionsToFit sizes for
+    // the title as exactly 1 line).
+    lines[0] = `${lines[0]} ${INDEX_OWNERSHIP_MARKER}`;
 
-    await fs.writeFile(this.getIndexPath(), lines.join('\n'), 'utf-8');
+    await fs.writeFile(indexPath, lines.join('\n'), 'utf-8');
     this.emit('index:curated', { lines: lines.length });
   }
 
@@ -971,6 +1002,26 @@ function pruneSectionsToFit(
 }
 
 /**
+ * Whether an existing MEMORY.md was authored by this bridge and is
+ * therefore safe to overwrite on the next curate.
+ *
+ * True for current-format output (carries INDEX_OWNERSHIP_MARKER) and for
+ * legacy pre-marker output (first line is exactly INDEX_TITLE_LINE, which
+ * is all buildIndexLines() ever produced before the marker existed) — the
+ * legacy check exists so upgrading to the marker-based guard doesn't
+ * silently stop curating every MEMORY.md this bridge already owned.
+ * Anything else (no marker, different or extra first-line content) is
+ * presumed foreign and left untouched.
+ */
+function isBridgeOwnedIndex(content: string): boolean {
+  if (content.includes(INDEX_OWNERSHIP_MARKER)) {
+    return true;
+  }
+  const firstLine = content.split('\n', 1)[0];
+  return firstLine === INDEX_TITLE_LINE;
+}
+
+/**
  * Build MEMORY.md index lines from curated sections.
  */
 function buildIndexLines(
@@ -978,7 +1029,7 @@ function buildIndexLines(
   topicMapping: Record<string, string>,
   sectionOrder?: string[],
 ): string[] {
-  const lines: string[] = ['# Claude Flow V3 Project Memory', ''];
+  const lines: string[] = [INDEX_TITLE_LINE, ''];
 
   // Use provided order, then append any remaining sections
   const orderedCategories = sectionOrder
